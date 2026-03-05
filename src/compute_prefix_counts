@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""
+Compute per-run and per-group prefix/case counts from prediction parquet files.
+
+Inputs:
+  --pred_dir : directory with per-run prediction parquet files (ExpNRunM.parquet)
+Outputs:
+  --out_csv_by_run   : per-run counts
+  --out_csv_by_group : group summary
+
+Assumptions:
+  Each parquet contains one row per prefix (per case event position), with at least:
+    exp, run, run_id, productIDStr, prefix_len, case_len, progress, group (optional)
+
+If `group` is missing, we derive it from exp/run using the CAiSE paper grouping:
+  target: exp 1-9
+  source: exp 10-18 (source-test runs are provided by --source_test_runs)
+  alt   : exp 19-27
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import re
+import numpy as np
+import pandas as pd
+
+
+F_RE = re.compile(r"Exp(?P<exp>\d+)Run(?P<run>\d+)\.parquet$", re.IGNORECASE)
+
+SOURCE_EXPS = set(range(10, 19))
+TARGET_EXPS = set(range(1, 10))
+ALT_EXPS    = set(range(19, 28))
+
+
+def label_group(exp: int, run: int, source_test_runs: set[int]) -> str:
+    if exp in TARGET_EXPS:
+        return "target (Exp1–9)"
+    if exp in SOURCE_EXPS:
+        if run in source_test_runs:
+            return "source-test (Exp10–18)"
+        return "source-train (Exp10–18)"
+    if exp in ALT_EXPS:
+        return "alt (Exp19–27)"
+    return "other"
+
+
+def safe_numeric(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pred_dir", required=True, type=str, help="Directory with ExpNRunM.parquet prediction files.")
+    ap.add_argument("--out_csv_by_run", default="outputs/fig2/prefix_counts_by_run.csv", type=str)
+    ap.add_argument("--out_csv_by_group", default="outputs/fig2/prefix_counts_by_group.csv", type=str)
+    ap.add_argument("--source_test_runs", default="19,20", type=str, help="Comma-separated source test run numbers.")
+    args = ap.parse_args()
+
+    pred_dir = Path(args.pred_dir)
+    out_csv_by_run = Path(args.out_csv_by_run)
+    out_csv_by_group = Path(args.out_csv_by_group)
+    out_csv_by_run.parent.mkdir(parents=True, exist_ok=True)
+    out_csv_by_group.parent.mkdir(parents=True, exist_ok=True)
+
+    source_test_runs = {int(x.strip()) for x in args.source_test_runs.split(",") if x.strip()}
+
+    files = sorted(pred_dir.glob("Exp*Run*.parquet"))
+    if not files:
+        raise FileNotFoundError(f"No Exp*Run*.parquet files found in: {pred_dir}")
+
+    per_run_rows = []
+
+    for fp in files:
+        m = F_RE.search(fp.name)
+        if not m:
+            continue
+        exp = int(m.group("exp"))
+        run = int(m.group("run"))
+        run_id = f"Exp{exp}Run{run}"
+
+        # Load only needed columns (faster, smaller memory)
+        df = pd.read_parquet(fp, columns=[
+            c for c in [
+                "exp", "run", "run_id", "productIDStr",
+                "prefix_len", "case_len", "progress", "group"
+            ]
+            if c in pd.read_parquet(fp, engine="auto").columns  # fallback: check columns exist
+        ])
+
+        # Normalize required fields if missing
+        if "exp" not in df.columns:
+            df["exp"] = exp
+        if "run" not in df.columns:
+            df["run"] = run
+        if "run_id" not in df.columns:
+            df["run_id"] = run_id
+
+        if "group" not in df.columns:
+            df["group"] = label_group(exp, run, source_test_runs)
+        else:
+            # fix common encoding issue
+            df["group"] = df["group"].astype(str).str.replace("â€“", "–", regex=False)
+
+        # Basic sanity: one row per prefix
+        n_prefix_rows = int(len(df))
+
+        # Cases
+        if "productIDStr" in df.columns:
+            n_cases = int(df["productIDStr"].nunique(dropna=True))
+        else:
+            n_cases = np.nan
+
+        # Case length stats (should exist in your pipeline)
+        if "case_len" in df.columns:
+            cl = safe_numeric(df["case_len"])
+            case_len_mean = float(np.nanmean(cl))
+            case_len_median = float(np.nanmedian(cl))
+        else:
+            case_len_mean = np.nan
+            case_len_median = np.nan
+
+        # Prefix length stats
+        if "prefix_len" in df.columns:
+            pl = safe_numeric(df["prefix_len"])
+            prefix_len_mean = float(np.nanmean(pl))
+            prefix_len_median = float(np.nanmedian(pl))
+        else:
+            prefix_len_mean = np.nan
+            prefix_len_median = np.nan
+
+        # Average prefixes per case (≈ mean case_len if all prefixes are included)
+        prefixes_per_case = (n_prefix_rows / n_cases) if (n_cases and n_cases > 0) else np.nan
+
+        per_run_rows.append({
+            "exp": exp,
+            "run": run,
+            "run_id": run_id,
+            "group": df["group"].iloc[0],
+            "n_prefix_rows": n_prefix_rows,
+            "n_cases": n_cases,
+            "prefixes_per_case": prefixes_per_case,
+            "case_len_mean": case_len_mean,
+            "case_len_median": case_len_median,
+            "prefix_len_mean": prefix_len_mean,
+            "prefix_len_median": prefix_len_median,
+        })
+
+    by_run = pd.DataFrame(per_run_rows).sort_values(["exp", "run"]).reset_index(drop=True)
+    by_run.to_csv(out_csv_by_run, index=False, encoding="utf-8")
+    print(f"Wrote: {out_csv_by_run}  rows={len(by_run)}")
+
+    # Group summaries (focus on evaluation groups; keep source-train optional)
+    def summarize(gdf: pd.DataFrame) -> dict:
+        x = gdf["n_prefix_rows"].astype(float).values
+        y = gdf["n_cases"].astype(float).values
+        return {
+            "n_runs": int(len(gdf)),
+            "prefix_rows_mean": float(np.nanmean(x)),
+            "prefix_rows_median": float(np.nanmedian(x)),
+            "prefix_rows_q1": float(np.nanquantile(x, 0.25)),
+            "prefix_rows_q3": float(np.nanquantile(x, 0.75)),
+            "cases_mean": float(np.nanmean(y)),
+            "cases_median": float(np.nanmedian(y)),
+            "cases_q1": float(np.nanquantile(y, 0.25)),
+            "cases_q3": float(np.nanquantile(y, 0.75)),
+        }
+
+    grp_rows = []
+    for g, gdf in by_run.groupby("group"):
+        row = {"group": g}
+        row.update(summarize(gdf))
+        grp_rows.append(row)
+
+    by_group = pd.DataFrame(grp_rows).sort_values("group")
+    by_group.to_csv(out_csv_by_group, index=False, encoding="utf-8")
+    print(f"Wrote: {out_csv_by_group}  rows={len(by_group)}")
+
+
+if __name__ == "__main__":
+    main()
