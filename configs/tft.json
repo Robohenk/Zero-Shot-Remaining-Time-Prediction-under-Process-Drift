@@ -1,0 +1,26 @@
+{
+  "data": {
+    "data_root": "data",
+    "output_root": "outputs",
+    "max_len_cap": 200
+  },
+  "split": {
+    "source_test_runs": [19, 20]
+  },
+  "train": {
+    "model_name": "tft",
+    "seed": 7,
+    "epochs": 10,
+    "batch_size": 128,
+    "learning_rate": 0.001,
+    "hidden_dim": 64,
+    "transformer_heads": 4,
+    "transformer_ff_dim": 128,
+    "transformer_layers": 2,
+    "dropout": 0.1,
+    "validation_fraction": 0.1,
+    "use_early_stopping": true,
+    "patience": 3,
+    "cpu_workers": 4
+  }
+}
